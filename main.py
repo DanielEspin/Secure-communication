@@ -30,11 +30,24 @@ from argon2.exceptions import VerificationError
 from common import JSONReader, send_json
 
 HOST, PORT = "0.0.0.0", 8443
-USERS_FILE = "users.json"
-SHADOWS_FILE = "shadows.txt"
-CERTFILE, KEYFILE = "server.crt", "server.key"
+
+# Anchor every path to the folder this script lives in, not the shell's current
+# directory. Otherwise `python C:\proj\main.py` launched from your home folder
+# looks for the cert in the wrong place.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USERS_FILE = os.path.join(BASE_DIR, "users.json")
+SHADOWS_FILE = os.path.join(BASE_DIR, "shadows.txt")
+CERTFILE = os.path.join(BASE_DIR, "server.crt")
+KEYFILE = os.path.join(BASE_DIR, "server.key")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
+
+# How many failures are forgiven before the lockout clock starts. Login gets a
+# generous allowance because typos are common and the password has real entropy.
+# The channel handshake gets far fewer, because the shared number only has 100
+# possible values -- every free guess there is 1% of the keyspace given away.
+LOGIN_FREE_ATTEMPTS = 5
+CHANNEL_FREE_ATTEMPTS = 2
 LOCKOUT_CAP_MINUTES = 15
 
 ph = PasswordHasher()
@@ -45,7 +58,7 @@ DUMMY_HASH = ph.hash("timing-equalizer-not-a-real-password")
 
 state_lock = threading.RLock()
 online = {}     # username -> Session
-lockouts = {}   # username -> [consecutive_failures, unlock_epoch_seconds]
+lockouts = {}   # (username, scope) -> [consecutive_failures, unlock_epoch_seconds]
 
 
 # --------------------------------------------------------------------------
@@ -102,30 +115,46 @@ def verify_login(username, password):
 
 
 # --------------------------------------------------------------------------
-# Lockout: exponential backoff, enforced server-side only
+# Lockout: N free attempts, then exponential backoff. Server-side only.
+#
+# Login and channel failures are counted separately, under keys like
+# ("alice", "login") and ("alice", "channel"). Burning your login attempts
+# should not eat into your channel attempts -- they guard different secrets.
 # --------------------------------------------------------------------------
 
-def seconds_locked(username):
+def seconds_locked(username, scope):
     with state_lock:
-        entry = lockouts.get(username)
+        entry = lockouts.get((username, scope))
         if not entry:
             return 0
         return max(0, entry[1] - time.time())
 
 
-def record_failure(username):
-    """Increment the failure counter and return the new lockout in minutes."""
+def record_failure(username, scope, free_attempts):
+    """
+    Count one failure.
+
+    Returns (lock_minutes, attempts_remaining). While still inside the free
+    allowance, lock_minutes is 0 and attempts_remaining counts down. After the
+    allowance is exhausted, the lockout doubles each time: 1, 2, 4, 8, then
+    holds at LOCKOUT_CAP_MINUTES so nobody is shut out for days.
+    """
     with state_lock:
-        entry = lockouts.setdefault(username, [0, 0])
+        entry = lockouts.setdefault((username, scope), [0, 0])
         entry[0] += 1
-        minutes = min(2 ** (entry[0] - 1), LOCKOUT_CAP_MINUTES)
+
+        if entry[0] <= free_attempts:
+            return 0, free_attempts - entry[0]
+
+        exponent = entry[0] - free_attempts - 1
+        minutes = min(2 ** exponent, LOCKOUT_CAP_MINUTES)
         entry[1] = time.time() + minutes * 60
-        return minutes
+        return minutes, 0
 
 
-def clear_failures(username):
+def clear_failures(username, scope):
     with state_lock:
-        lockouts.pop(username, None)
+        lockouts.pop((username, scope), None)
 
 
 # --------------------------------------------------------------------------
@@ -207,15 +236,19 @@ def cmd_login(session, msg):
     username = (msg.get("user") or "").strip().lower()
     password = msg.get("pass") or ""
 
-    remaining = seconds_locked(username)
+    remaining = seconds_locked(username, "login")
     if remaining > 0:
         return session.send({"ev": "error",
                              "text": f"Account locked. Try again in {int(remaining)}s."})
 
     if not verify_login(username, password):
-        mins = record_failure(username)
-        return session.send({"ev": "error",
-                             "text": f"Invalid username or password. Locked for {mins} min."})
+        minutes, left = record_failure(username, "login", LOGIN_FREE_ATTEMPTS)
+        if minutes:
+            text = f"Invalid username or password. Account locked for {minutes} min."
+        else:
+            text = (f"Invalid username or password. "
+                    f"{left} attempt{'s' if left != 1 else ''} remaining before lockout.")
+        return session.send({"ev": "error", "text": text})
 
     with state_lock:
         if username in online:
@@ -230,7 +263,7 @@ def cmd_login(session, msg):
                 break
         save_users(users)
 
-    clear_failures(username)
+    clear_failures(username, "login")
     session.send({"ev": "ok", "text": f"Login successful. Welcome, {username}."})
 
 
@@ -243,7 +276,7 @@ def cmd_who(session, _msg):
 def cmd_chat(session, msg):
     target = (msg.get("with") or "").strip().lower()
 
-    remaining = seconds_locked(session.user)
+    remaining = seconds_locked(session.user, "channel")
     if remaining > 0:
         return session.send({"ev": "error",
                              "text": f"You are locked out. Try again in {int(remaining)}s."})
@@ -291,18 +324,24 @@ def cmd_handshake_failed(session, _msg):
         culprit = session.user if session.initiator else (other.user if other else None)
 
     if culprit:
-        mins = record_failure(culprit)
+        minutes, left = record_failure(culprit, "channel", CHANNEL_FREE_ATTEMPTS)
+        if minutes:
+            text = f"Wrong channel password or number. Locked for {minutes} min."
+        else:
+            text = (f"Wrong channel password or number. "
+                    f"{left} attempt{'s' if left != 1 else ''} remaining before lockout.")
         target = online.get(culprit)
         if target:
-            target.send({"ev": "error",
-                         "text": f"Wrong channel password or number. Locked for {mins} min."})
+            target.send({"ev": "error", "text": text})
     end_chat(session, "Handshake failed. Chat closed.")
     session.send({"ev": "info", "text": "Handshake failed. Chat closed."})
 
 
 def cmd_handshake_ok(session, _msg):
+    clear_failures(session.user, "channel")
     other = peer_session(session)
     if other:
+        clear_failures(other.user, "channel")
         other.send({"ev": "hs_ok"})
     session.send({"ev": "hs_ok"})
 
@@ -369,9 +408,11 @@ def handle_client(sock, addr):
 
 def main():
     if not (os.path.exists(CERTFILE) and os.path.exists(KEYFILE)):
-        print("Missing server.crt / server.key. Generate them with:\n")
-        print('  openssl req -x509 -newkey rsa:2048 -nodes -days 365 \\')
-        print('    -keyout server.key -out server.crt -subj "/CN=localhost"\n')
+        print("Missing certificate. Generate one first:\n")
+        print("    python make_cert.py\n")
+        print(f"Expected to find them in: {BASE_DIR}")
+        for path in (CERTFILE, KEYFILE):
+            print(f"  {'found  ' if os.path.exists(path) else 'MISSING'} {path}")
         return
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

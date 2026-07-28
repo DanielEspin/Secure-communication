@@ -3,3 +3,4 @@ lifeisahighway:$argon2id$v=19$m=65536,t=3,p=4$iJr3aHlHdiLlhSvxaAobOQ$zcAVYpzazaN
 daniel:$argon2id$v=19$m=65536,t=3,p=4$OWRWPAoLb+7PB4qcaNqMOQ$rMoPteS7ZeQ5PJqHF43CxXh5oEfzOwgB7OaN0I6pczE
 daniel1:$argon2id$v=19$m=65536,t=3,p=4$FQfcWqB+Nx/tvaWhqv0sLg$BoYCA49u2S7kjMsDHQHvJiey3NRYRWJItj92ywdNebc
 daniel2:$argon2id$v=19$m=65536,t=3,p=4$gfF4OaE4MzDOV55qMMR0SA$X7CGZSc+bpWo1oyMkdC7Jtv/LMWWt2O65hTsdJp2Pwo
+daniel3:$argon2id$v=19$m=65536,t=3,p=4$4ziolAS3FXKk9ngm/iWlXg$hDjJlC4MSNWtvopphmirQ+KZXyeAwSh20yhvp5YuNuc
